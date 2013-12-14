@@ -8,10 +8,35 @@ require Exporter;
 
 our @ISA = qw(Exporter);
 
-our $VERSION = '0.23';
+our $VERSION = '0.24';
 
 #-#use Win32::SerialPort qw(:STAT 0.19 );
 use Device::SerialPort qw(:STAT 0.19 );
+use IO::Socket::INET;
+use Socket;
+
+{
+    package NetSerial;
+    use base 'IO::Socket::INET';
+
+    sub write {
+	my ($self, @args) = @_;
+
+	return $self->send(@args);
+    }
+
+    sub read {
+	my ($self, $len) = @_;
+
+	my $pkt;
+	my $res = $self->recv($pkt, $len);
+
+	return undef if (!defined($res));
+
+	return (length($pkt), $pkt);
+    }
+
+}
 
 use Time::HiRes qw(usleep gettimeofday time);
 use Data::Dumper;
@@ -45,41 +70,69 @@ sub new
   #my $conf = $arg_hsh{'conf'} || 'Conf.ini';
   
   #my $port_obj = new Win32::SerialPort ($port) || die "Can't open $port: $^E\n";
-  my $port_obj = new Device::SerialPort ($port) || die "Can't open $port: $^E\n";
+  my $port_obj;
   
-  my $baudrate = $arg_hsh{baudrate} || 19200;
-  my $parity   = $arg_hsh{parity}   || "none";
-  my $databits = $arg_hsh{databits} || 8;
-  my $stopbits = $arg_hsh{stopbits} || 1;
+  if ($arg_hsh{host} eq 'auto') {
+    my $s = IO::Socket::INET->new(PeerPort => 22222, PeerHost => '255.255.255.255', Proto => 'udp', Broadcast => 1, ReuseAddr => 1) || die @$;
+    my $sr = IO::Socket::INET->new(Proto => 'udp', ReuseAddr => 1) || die @$;
 
-  # After new, must check for failure
-  $port_obj->baudrate($baudrate);
-  $port_obj->parity($parity);
-  $port_obj->databits($databits);
-  $port_obj->stopbits($stopbits);
-  #-# $port_obj->read_interval(1);    # max time between read char (milliseconds) Not in Device::SerialPort 
- 
-  $port_obj->read_const_time(10000);  # total = (avg * bytes) + const 
-    
-  #$port_obj->handshake("rts");
-  #$port_obj->buffers(4096, 4096);
+    $sr->bind($s->sockname());
+    $s->send('discoverwlip');
 
-  $port_obj->write_settings || warn 'Write Settings Failed';
+    { 
+      local $SIG{ALRM} = sub { die 'Cannot find VantagePro'; }; 
+      alarm 3; 
+      my $pkt;
+      my $addr = $sr->recv($pkt, 256);
 
-  #$port_obj->save($conf);
-
-  unless ($port_obj) { die "Can't change Device_Control_Block: $^E\n"; }
-
-  my ($BlockingFlags, $InBytes, $OutBytes, $LatchErrorFlags) = $port_obj->status
-      || warn "could not get port status\n";
-
-  if ($BlockingFlags)
-  {
-     #warn "Port is blocked $BlockingFlags, $InBytes, $OutBytes, $LatchErrorFlags\n";
+      my ($port, $a) = sockaddr_in($addr);
+      $arg_hsh{host} = join(':', inet_ntoa($a), $port);
+      alarm 0;
+    }
   }
 
-  $port_obj->purge_all();  # these don't seem to work but try anyway.
-  $port_obj->purge_rx();
+  if ($arg_hsh{host}) {
+      my ($host, $portnumber) = split(/:/, $arg_hsh{host});
+      $portnumber ||= 23;
+
+      $port_obj = NetSerial->new(PeerPort => $portnumber, PeerAddr => $host, Proto => 'tcp') || die "Cannot connect to host $@\n";
+  } else {
+      $port_obj = new Device::SerialPort ($port) || die "Can't open $port: $^E\n";
+      
+      my $baudrate = $arg_hsh{baudrate} || 19200;
+      my $parity   = $arg_hsh{parity}   || "none";
+      my $databits = $arg_hsh{databits} || 8;
+      my $stopbits = $arg_hsh{stopbits} || 1;
+
+      # After new, must check for failure
+      $port_obj->baudrate($baudrate);
+      $port_obj->parity($parity);
+      $port_obj->databits($databits);
+      $port_obj->stopbits($stopbits);
+      #-# $port_obj->read_interval(1);    # max time between read char (milliseconds) Not in Device::SerialPort 
+     
+      $port_obj->read_const_time(10000);  # total = (avg * bytes) + const 
+	
+      #$port_obj->handshake("rts");
+      #$port_obj->buffers(4096, 4096);
+
+      $port_obj->write_settings || warn 'Write Settings Failed';
+
+      #$port_obj->save($conf);
+
+      unless ($port_obj) { die "Can't change Device_Control_Block: $^E\n"; }
+
+      my ($BlockingFlags, $InBytes, $OutBytes, $LatchErrorFlags) = $port_obj->status
+	  || warn "could not get port status\n";
+
+      if ($BlockingFlags)
+      {
+	 #warn "Port is blocked $BlockingFlags, $InBytes, $OutBytes, $LatchErrorFlags\n";
+      }
+
+      $port_obj->purge_all();  # these don't seem to work but try anyway.
+      $port_obj->purge_rx();
+  }
  
   # The object data structure
   my $self = bless {
@@ -102,17 +155,26 @@ sub wake_up
   {
     my $cnt_out = $self->{'port_obj'}->write("\n");
     unless ($cnt_out) { warn "write failed\n" };
-    my ($cnt_in, $str) = $self->read(2);
+    my ($cnt_in, $str) = $self->read(128);
 	
-    if ($str eq "\n\r" ) 
+    if ($cnt_in && substr($str, -2) eq "\n\r" ) 
 	{ 
 		print "Success on Wakeup $_\n" if $Verbose; 
     	return 1; 
 	}
 	 
-	warn "Not responding to Wakeup\n"; 
+	$cnt_in ||= 0;
+	warn "Not responding to Wakeup (read $cnt_in bytes)\n"; 
 	
-	usleep 1200000; # As per page 5 of VantagePro Doc 
+	my $before_read = time;
+	if ($cnt_in) {
+	    $self->read(128);		# flush any input
+	}
+	my $waited = time - $before_read;
+
+	if ($waited < 1.2) {
+	    usleep 1200000 - ($waited * 1000000); # As per page 5 of VantagePro Doc 
+	}
   }
 
   warn("Could not unit wake up"); 
@@ -309,7 +371,7 @@ sub start_loop
   
   my ($cnt_in, $str) = $self->read(1);
  
-  if ( ord($str) != 6 ) { warn("Ack not returned for Loop"); return 0; }
+  if ( !$cnt_in || ord($str) != 6 ) { warn(sprintf("Ack not returned for Loop (%d bytes: '0x%s' was returned)", $cnt_in, unpack("h*", $str || ''))); return 0; }
 
   return 1; 
 }
@@ -777,6 +839,14 @@ Defaults for these argument parameters are as follows:
   $arg_hsh{parity}   = "none";
   $arg_hsh{databits} = 8;
   $arg_hsh{stopbits} = 1;
+  $arg_hsh{host}     = undef;
+
+If the C<host> argument is supplied, then it should be the ip address of the Weatherlink-IP. 
+The C<port> argument will then be ignored and all communication will use the network. If
+the ip address is not known, then the special value of C<auto> can be used, and the local
+network will be searched for the Weatherlink-IP.
+
+ 
 
 =head2 wake_up
 
